@@ -87,6 +87,18 @@ _RE_RGB_COLOR = re.compile(r"(?<![a-z-])color:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)"
 _RE_COLORID_CSS = re.compile(r"(?<![>\w])\[data-colorid=(\w+)\]\{color:(#[0-9a-fA-F]+)\}")
 _RE_HEX_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
+# Graphviz macros of the "Graphviz Diagrams for Confluence" app, mapped to the DOT graph
+# keyword their body has to be wrapped in. The `graphviz` macro body is already a complete
+# DOT document (empty keyword); the `digraph` macro body holds only the statements and gets
+# its graph header from the plugin at render time.
+_GRAPHVIZ_MACROS: dict[str, str] = {"graphviz": "", "digraph": "digraph"}
+
+# Matches a DOT graph header such as `digraph name {`. The opening brace has to appear
+# before the first newline so Mermaid's `graph TD` / `graph LR` is not read as DOT.
+_RE_DOT_GRAPH_HEADER = re.compile(r"^\s*(?:strict\s+)?(?:di)?graph\b[^{\n]*\{", re.IGNORECASE)
+
+_RE_DOT_BARE_ID = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+
 # Confluence default header backgrounds — applied automatically to <th> cells, and
 # (in matrix-style tables) to row-label <td>s. Treated as "no user-chosen colour".
 _DEFAULT_HEADER_BGS = frozenset({"#f4f5f7", "#f2f2f2"})
@@ -94,6 +106,14 @@ _DEFAULT_HEADER_BGS = frozenset({"#f4f5f7", "#f2f2f2"})
 
 def _rgb_to_hex(r: int, g: int, b: int) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _dot_id(name: str) -> str:
+    """Return `name` as a DOT identifier, quoting it when it is not a bare ID."""
+    if _RE_DOT_BARE_ID.match(name):
+        return name
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _render_meta_bind_view_fields(props: dict[str, str], mode: str) -> str:
@@ -1477,8 +1497,8 @@ class Page(Document):
             self._colorid_map_cache: dict[str, str] | None = None
             self._image_captions_cache: dict[str, str] | None = None
             self._panel_icon_map_cache: dict[str, str] | None = None
-            self._plantuml_index: int = 0
-            self._storage_plantuml_macros_cache: list[Tag] | None = None
+            self._storage_macros_cache: dict[str, list[Tag]] = {}
+            self._storage_macro_positions: dict[str, int] = {}
 
         @property
         def _colorid_map(self) -> dict[str, str]:
@@ -1494,21 +1514,55 @@ class Page(Document):
                 self._colorid_map_cache = cache
             return self._colorid_map_cache
 
-        @property
-        def _storage_plantuml_macros(self) -> list[Tag]:
-            """Cache and return all PlantUML structured-macros from body.storage."""
-            if self._storage_plantuml_macros_cache is None:
-                macros: list[Tag] = []
+        def _storage_macros(self, name: str) -> list[Tag]:
+            """Cache and return all structured-macros named `name` from body.storage."""
+            macros = self._storage_macros_cache.get(name)
+            if macros is None:
+                macros = []
                 if self.page.body_storage:
                     wrapped = f"<root>{self.page.body_storage}</root>"
                     soup = BeautifulSoup(wrapped, "xml")
                     macros.extend(
                         macro
                         for macro in soup.find_all("structured-macro")
-                        if isinstance(macro, Tag) and macro.get("name") == "plantuml"
+                        if isinstance(macro, Tag) and macro.get("name") == name
                     )
-                self._storage_plantuml_macros_cache = macros
-            return self._storage_plantuml_macros_cache
+                self._storage_macros_cache[name] = macros
+            return macros
+
+        def _next_storage_macro(self, name: str) -> Tag | None:
+            """Return the next unconsumed body.storage macro named `name`.
+
+            Server / Data Center view HTML carries no `data-macro-id`, so macros are
+            matched by position: the Nth occurrence in the view HTML is the Nth macro
+            of that name in body.storage. Positions are tracked per macro name so
+            different macro types do not consume each other's slots.
+            """
+            macros = self._storage_macros(name)
+            idx = self._storage_macro_positions.get(name, 0)
+            self._storage_macro_positions[name] = idx + 1
+            return macros[idx] if idx < len(macros) else None
+
+        def _editor2_macro(self, name: str, macro_id: str) -> Tag | None:
+            """Find a structured-macro in editor2 XML by name and macro-id (Cloud format)."""
+            if not self.page.editor2:
+                return None
+            wrapped = f"<root>{self.page.editor2}</root>"
+            soup = BeautifulSoup(wrapped, "xml")
+            for macro in soup.find_all("structured-macro"):
+                if not isinstance(macro, Tag):
+                    continue
+                if macro.get("name") == name and macro.get("macro-id") == macro_id:
+                    return macro
+            return None
+
+        @staticmethod
+        def _macro_parameter(macro: Tag, name: str) -> str | None:
+            """Return the value of a structured-macro `<ac:parameter>`, or None."""
+            for param in macro.find_all("parameter", recursive=False):
+                if isinstance(param, Tag) and param.get("name") == name:
+                    return param.get_text(strip=True) or None
+            return None
 
         @property
         def _image_captions(self) -> dict[str, str]:
@@ -1741,6 +1795,8 @@ class Page(Document):
                     "details": self.convert_page_properties,
                     "drawio": self.convert_drawio,
                     "plantuml": self.convert_plantuml,
+                    "graphviz": self.convert_graphviz,
+                    "digraph": self.convert_graphviz,
                     "scroll-ignore": self.convert_hidden_content,
                     "toc": self.convert_toc,
                     "jira": self.convert_jira_table,
@@ -1846,6 +1902,8 @@ class Page(Document):
                         return result
                 if el["data-macro-name"] == "plantuml":
                     return self.convert_plantuml(el, text, parent_tags)
+                if el["data-macro-name"] in _GRAPHVIZ_MACROS:
+                    return self.convert_graphviz(el, text, parent_tags)
 
             if el.has_attr("class") and "inline-comment-marker" in el["class"]:
                 return self.convert_inline_comment_marker(el, text, parent_tags)
@@ -2002,6 +2060,10 @@ class Page(Document):
 
             if "@startuml" in text:
                 code_language = "plantuml"
+            elif not code_language and _RE_DOT_GRAPH_HEADER.match(text):
+                # Only when no brush language was declared: a bare `graph`/`digraph`
+                # keyword is far weaker evidence than `@startuml`.
+                code_language = "dot"
 
             return f"\n\n```{code_language}\n{text}\n```\n\n"
 
@@ -2439,35 +2501,26 @@ class Page(Document):
 
         def _extract_uml_from_editor2(self, macro_id: str) -> str | None:
             """Extract PlantUML source from editor2 XML by macro-id (Cloud format)."""
-            if not self.page.editor2:
+            macro = self._editor2_macro("plantuml", macro_id)
+            if macro is None:
                 return None
-            wrapped = f"<root>{self.page.editor2}</root>"
-            soup = BeautifulSoup(wrapped, "xml")
-            for macro in soup.find_all("structured-macro"):
-                if not isinstance(macro, Tag):
-                    continue
-                if macro.get("name") != "plantuml" or macro.get("macro-id") != macro_id:
-                    continue
-                plain_text_body = macro.find("plain-text-body")
-                if not isinstance(plain_text_body, Tag):
-                    continue
-                cdata = plain_text_body.get_text(strip=True)
-                if not cdata:
-                    continue
-                try:
-                    return json.loads(cdata).get("umlDefinition") or None
-                except json.JSONDecodeError:
-                    return None
-            return None
+            plain_text_body = macro.find("plain-text-body")
+            if not isinstance(plain_text_body, Tag):
+                return None
+            cdata = plain_text_body.get_text(strip=True)
+            if not cdata:
+                return None
+            try:
+                return json.loads(cdata).get("umlDefinition") or None
+            except json.JSONDecodeError:
+                return None
 
         def _extract_uml_from_storage(self) -> str | None:
             """Extract PlantUML source from body.storage by position (Server format)."""
-            storage_macros = self._storage_plantuml_macros
-            idx = self._plantuml_index
-            self._plantuml_index += 1
-            if idx >= len(storage_macros):
+            macro = self._next_storage_macro("plantuml")
+            if macro is None:
                 return None
-            plain_text_body = storage_macros[idx].find("plain-text-body")
+            plain_text_body = macro.find("plain-text-body")
             if not isinstance(plain_text_body, Tag):
                 return None
             uml = plain_text_body.get_text(strip=True)
@@ -2504,6 +2557,68 @@ class Page(Document):
 
             logger.warning("PlantUML macro could not be resolved from editor2 or body.storage")
             return "\n<!-- PlantUML diagram (source not found) -->\n\n"
+
+        def _wrap_dot_source(self, macro_name: str, macro: Tag, body: str) -> str:
+            """Reconstruct a complete DOT document from a Graphviz macro body.
+
+            The `graphviz` macro body is already a complete DOT document. The `digraph`
+            macro body holds only the statements — the plugin supplies the graph header
+            when rendering — so the header is rebuilt here from the macro's `name` and
+            `attributes` parameters to yield DOT that renders standalone.
+            """
+            keyword = _GRAPHVIZ_MACROS.get(macro_name, "")
+            if not keyword or _RE_DOT_GRAPH_HEADER.match(body):
+                return body
+
+            graph_name = _dot_id(self._macro_parameter(macro, "name") or "G")
+            attributes = self._macro_parameter(macro, "attributes")
+            statements = f"{attributes}\n{body}" if attributes else body
+            # Statements are emitted verbatim: DOT permits line-continued quoted strings
+            # and HTML-like labels whose content would change if re-indented.
+            return f"{keyword} {graph_name} {{\n{statements}\n}}"
+
+        def _extract_dot_from_macro(self, macro_name: str, macro: Tag) -> str | None:
+            """Return the complete DOT source held by a Graphviz structured-macro."""
+            plain_text_body = macro.find("plain-text-body")
+            if not isinstance(plain_text_body, Tag):
+                return None
+            body = plain_text_body.get_text().strip()
+            if not body:
+                return None
+            return self._wrap_dot_source(macro_name, macro, body)
+
+        def convert_graphviz(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
+            """Convert Graphviz `graphviz` / `digraph` macros to fenced DOT code blocks.
+
+            Source lookup mirrors `convert_plantuml`: editor2 XML by ``macro-id`` first
+            (Cloud), then positional matching against ``body.storage`` (Server / Data
+            Center, where the view HTML carries no ``macro-id``). Unlike PlantUML, the
+            body is raw DOT rather than a JSON envelope.
+            """
+            macro_name = str(el.get("data-macro-name", ""))
+            dot: str | None = None
+
+            # Strategy 1: editor2 with macro-id (Cloud)
+            macro_id = el.get("data-macro-id")
+            if macro_id:
+                macro = self._editor2_macro(macro_name, str(macro_id))
+                if macro is not None:
+                    dot = self._extract_dot_from_macro(macro_name, macro)
+
+            # Strategy 2: body.storage fallback (Server / Data Center)
+            if not dot:
+                macro = self._next_storage_macro(macro_name)
+                if macro is not None:
+                    dot = self._extract_dot_from_macro(macro_name, macro)
+
+            if dot:
+                return f"\n```dot\n{dot}\n```\n\n"
+
+            logger.warning(
+                f"Graphviz '{macro_name}' macro could not be resolved "
+                f"from editor2 or body.storage"
+            )
+            return "\n<!-- Graphviz diagram (source not found) -->\n\n"
 
         def convert_include(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             """Convert Confluence `include` / `excerpt-include` macro.
