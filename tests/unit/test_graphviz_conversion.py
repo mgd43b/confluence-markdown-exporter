@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from bs4 import BeautifulSoup
+from bs4 import Tag
 
 from confluence_markdown_exporter.confluence import Page
 
@@ -33,8 +34,11 @@ def _storage_macro(name: str, body: str, params: str = "") -> str:
     )
 
 
-def _el(html: str, tag: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "html.parser").find(tag)
+def _el(html: str, tag: str) -> Tag:
+    """Return the first `tag` in `html`, failing the test if the fixture has no such tag."""
+    element = BeautifulSoup(html, "html.parser").find(tag)
+    assert isinstance(element, Tag), f"fixture HTML has no <{tag}>: {html}"
+    return element
 
 
 class TestGraphvizMacroConversion:
