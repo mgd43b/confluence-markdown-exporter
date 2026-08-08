@@ -197,6 +197,81 @@ class TestDigraphMacroConversion:
 
         assert result.count("digraph G {") == 1
 
+    @pytest.mark.parametrize(
+        "comment",
+        ["// my graph", "# my graph", "/* my graph */", "// first\n// second"],
+    )
+    def test_leading_comment_does_not_defeat_the_header_check(self, comment: str) -> None:
+        """A pasted document opening with a comment must not be wrapped again.
+
+        Nesting `digraph` inside `digraph` is a DOT syntax error — only `subgraph` nests.
+        """
+        page = _make_page(
+            body_storage=_storage_macro("digraph", f"{comment}\ndigraph G {{\n  A -> B;\n}}"),
+        )
+        converter = Page.Converter(page)
+
+        result = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph"></div>', "div"), "", []
+        )
+
+        assert result.count("digraph G {") == 1
+
+    @pytest.mark.parametrize("name", ["graph", "digraph", "node", "edge", "subgraph", "strict"])
+    def test_reserved_word_graph_name_is_quoted(self, name: str) -> None:
+        """`digraph graph { ... }` is a DOT syntax error, so keywords must be quoted."""
+        page = _make_page(
+            body_storage=_storage_macro(
+                "digraph",
+                "A -> B",
+                params=f'<ac:parameter ac:name="name">{name}</ac:parameter>',
+            ),
+        )
+        converter = Page.Converter(page)
+
+        result = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph"></div>', "div"), "", []
+        )
+
+        assert f'digraph "{name}" {{' in result
+
+    def test_comma_separated_attributes_become_statements(self) -> None:
+        """A comma is not a valid statement separator at graph level."""
+        page = _make_page(
+            body_storage=_storage_macro(
+                "digraph",
+                "A -> B",
+                params=('<ac:parameter ac:name="attributes">rankdir=LR, size="8,5"</ac:parameter>'),
+            ),
+        )
+        converter = Page.Converter(page)
+
+        result = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph"></div>', "div"), "", []
+        )
+
+        # The comma inside the quoted `size` value has to survive.
+        assert 'rankdir=LR; size="8,5"' in result
+
+    def test_semicolon_attributes_pass_through_unchanged(self) -> None:
+        """A value that already reads as statements is left alone."""
+        page = _make_page(
+            body_storage=_storage_macro(
+                "digraph",
+                "A -> B",
+                params=(
+                    '<ac:parameter ac:name="attributes">rankdir=LR;\nbgcolor=white;</ac:parameter>'
+                ),
+            ),
+        )
+        converter = Page.Converter(page)
+
+        result = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph"></div>', "div"), "", []
+        )
+
+        assert "rankdir=LR;\nbgcolor=white;\nA -> B" in result
+
     def test_multiline_body_is_not_reindented(self) -> None:
         """Bodies are emitted verbatim so line-continued strings stay intact."""
         body = 'A [label="first\\\nsecond"]\nA -> B'
@@ -260,6 +335,37 @@ class TestGraphvizPositionalMatching:
 
         assert "digraph Full { C -> D }" in graphviz_result
         assert "digraph G {\nA -> B\n}" in digraph_result
+
+    def test_editor2_hit_still_advances_the_storage_position(self) -> None:
+        """A diagram resolved through editor2 must not leave its storage slot unconsumed.
+
+        Otherwise the next diagram falls back to slot 0 and silently renders the first
+        diagram's source.
+        """
+        page = _make_page(
+            editor2=(
+                '<ac:structured-macro ac:name="digraph" ac:macro-id="first">'
+                "<ac:plain-text-body><![CDATA[FROM -> EDITOR2]]></ac:plain-text-body>"
+                "</ac:structured-macro>"
+            ),
+            body_storage=(
+                _storage_macro("digraph", "FIRST -> ONE")
+                + _storage_macro("digraph", "SECOND -> TWO")
+            ),
+        )
+        converter = Page.Converter(page)
+
+        first = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph" data-macro-id="first"></div>', "div"), "", []
+        )
+        # No macro-id, so this one has to come from storage — and from slot 1, not slot 0.
+        second = converter.convert_graphviz(
+            _el('<div data-macro-name="digraph"></div>', "div"), "", []
+        )
+
+        assert "FROM -> EDITOR2" in first
+        assert "SECOND -> TWO" in second
+        assert "FIRST -> ONE" not in second
 
     def test_graphviz_does_not_consume_plantuml_slot(self) -> None:
         """Positional state is shared machinery — macro types must stay independent."""
@@ -391,9 +497,26 @@ class TestDotCodeBlockDetection:
             "strict digraph G {\n  A -> B;\n}",
             "graph G {\n  A -- B;\n}",
             "  DiGraph Foo {\n  A -> B;\n}",
+            "digraph{A->B}",
+            'digraph "my graph" {\n  A -> B;\n}',
         ],
     )
     def test_dot_source_gets_dot_fence(self, text: str) -> None:
+        converter = Page.Converter(_make_page())
+
+        result = converter.convert_pre(_el("<pre></pre>", "pre"), text, [])
+
+        assert "```dot" in result
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "// a comment\ndigraph G {\n  A -> B;\n}",
+            "/* a comment */\ndigraph G {\n  A -> B;\n}",
+            "# a comment\ndigraph G {\n  A -> B;\n}",
+        ],
+    )
+    def test_leading_comments_are_skipped(self, text: str) -> None:
         converter = Page.Converter(_make_page())
 
         result = converter.convert_pre(_el("<pre></pre>", "pre"), text, [])
@@ -410,6 +533,28 @@ class TestDotCodeBlockDetection:
     )
     def test_mermaid_flowchart_is_not_detected_as_dot(self, text: str) -> None:
         """Mermaid's `graph TD` has no brace on the header line — it must not match."""
+        converter = Page.Converter(_make_page())
+
+        result = converter.convert_pre(_el("<pre></pre>", "pre"), text, [])
+
+        assert "```dot" not in result
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "graph = {\n    'a': ['b'],\n}",
+            "digraph = {}",
+            "graph: Dict[str, int] = {}",
+            "const graph = { a: 1 };",
+            "subgraph cluster_0 {\n}",
+        ],
+    )
+    def test_code_declaring_a_graph_variable_is_not_detected_as_dot(self, text: str) -> None:
+        """DOT allows only an optional ID between the keyword and the brace.
+
+        A wider gap would swallow ordinary code that happens to assign a variable
+        named `graph` or `digraph`.
+        """
         converter = Page.Converter(_make_page())
 
         result = converter.convert_pre(_el("<pre></pre>", "pre"), text, [])

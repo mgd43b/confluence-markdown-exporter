@@ -93,11 +93,23 @@ _RE_HEX_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 # its graph header from the plugin at render time.
 _GRAPHVIZ_MACROS: dict[str, str] = {"graphviz": "", "digraph": "digraph"}
 
-# Matches a DOT graph header such as `digraph name {`. The opening brace has to appear
-# before the first newline so Mermaid's `graph TD` / `graph LR` is not read as DOT.
-_RE_DOT_GRAPH_HEADER = re.compile(r"^\s*(?:strict\s+)?(?:di)?graph\b[^{\n]*\{", re.IGNORECASE)
+# Matches a DOT graph header such as `digraph name {`: the keyword, an optional graph ID,
+# then the opening brace. Deliberately strict on both sides of the ID — a permissive gap
+# before the brace would also match ordinary code such as Python's `graph = {...}`, and the
+# brace has to sit on the header line so Mermaid's `graph TD` / `graph LR` is not read as DOT.
+_RE_DOT_GRAPH_HEADER = re.compile(
+    r'^\s*(?:strict\s+)?(?:di)?graph\s*(?:[A-Za-z_]\w*|\d+|"[^"\n]*")?\s*\{',
+    re.IGNORECASE,
+)
+
+# Leading DOT comments, stripped before header detection so a pasted document that opens
+# with a comment is still recognised as already having its graph header.
+_RE_DOT_LEADING_COMMENTS = re.compile(r"^(?:\s*(?://|#)[^\n]*\n|\s*/\*.*?\*/)+", re.DOTALL)
 
 _RE_DOT_BARE_ID = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+
+# DOT reserved words. Valid as a graph name only when quoted.
+_DOT_KEYWORDS = frozenset({"digraph", "edge", "graph", "node", "strict", "subgraph"})
 
 # Confluence default header backgrounds — applied automatically to <th> cells, and
 # (in matrix-style tables) to row-label <td>s. Treated as "no user-chosen colour".
@@ -109,11 +121,48 @@ def _rgb_to_hex(r: int, g: int, b: int) -> str:
 
 
 def _dot_id(name: str) -> str:
-    """Return `name` as a DOT identifier, quoting it when it is not a bare ID."""
-    if _RE_DOT_BARE_ID.match(name):
+    """Return `name` as a DOT identifier, quoting it when it is not a bare ID.
+
+    Reserved words are quoted too: `digraph graph { ... }` is a DOT syntax error.
+    """
+    if _RE_DOT_BARE_ID.match(name) and name.lower() not in _DOT_KEYWORDS:
         return name
     escaped = name.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _has_dot_graph_header(source: str) -> bool:
+    """Return whether `source` opens with a DOT graph header, ignoring leading comments."""
+    return bool(_RE_DOT_GRAPH_HEADER.match(_RE_DOT_LEADING_COMMENTS.sub("", source, count=1)))
+
+
+def _dot_attribute_statements(attributes: str) -> str:
+    """Normalise a Graphviz macro `attributes` value into DOT statements.
+
+    The parameter is usually written as a Graphviz attribute list
+    (`rankdir=LR, size="8,5"`), but a comma is not a valid statement separator at graph
+    level, so top-level commas are rewritten to semicolons. Commas inside quoted values
+    are left alone. A value that already uses semicolons is taken to be statements
+    already and passes through untouched.
+    """
+    if ";" in attributes:
+        return attributes
+
+    out: list[str] = []
+    in_quotes = False
+    is_escaped = False
+    for char in attributes:
+        if is_escaped:
+            is_escaped = False
+        elif char == "\\":
+            is_escaped = True
+        elif char == '"':
+            in_quotes = not in_quotes
+        elif char == "," and not in_quotes:
+            out.append(";")
+            continue
+        out.append(char)
+    return "".join(out)
 
 
 def _render_meta_bind_view_fields(props: dict[str, str], mode: str) -> str:
@@ -1499,6 +1548,7 @@ class Page(Document):
             self._panel_icon_map_cache: dict[str, str] | None = None
             self._storage_macros_cache: dict[str, list[Tag]] = {}
             self._storage_macro_positions: dict[str, int] = {}
+            self._editor2_soup_cache: BeautifulSoup | None = None
 
         @property
         def _colorid_map(self) -> dict[str, str]:
@@ -1543,12 +1593,21 @@ class Page(Document):
             self._storage_macro_positions[name] = idx + 1
             return macros[idx] if idx < len(macros) else None
 
+        @property
+        def _editor2_soup(self) -> BeautifulSoup | None:
+            """Parse and cache the page's editor2 XML, or None when the page has none."""
+            if self._editor2_soup_cache is None:
+                if not self.page.editor2:
+                    return None
+                wrapped = f"<root>{self.page.editor2}</root>"
+                self._editor2_soup_cache = BeautifulSoup(wrapped, "xml")
+            return self._editor2_soup_cache
+
         def _editor2_macro(self, name: str, macro_id: str) -> Tag | None:
             """Find a structured-macro in editor2 XML by name and macro-id (Cloud format)."""
-            if not self.page.editor2:
+            soup = self._editor2_soup
+            if soup is None:
                 return None
-            wrapped = f"<root>{self.page.editor2}</root>"
-            soup = BeautifulSoup(wrapped, "xml")
             for macro in soup.find_all("structured-macro"):
                 if not isinstance(macro, Tag):
                     continue
@@ -2060,7 +2119,7 @@ class Page(Document):
 
             if "@startuml" in text:
                 code_language = "plantuml"
-            elif not code_language and _RE_DOT_GRAPH_HEADER.match(text):
+            elif not code_language and _has_dot_graph_header(text):
                 # Only when no brush language was declared: a bare `graph`/`digraph`
                 # keyword is far weaker evidence than `@startuml`.
                 code_language = "dot"
@@ -2567,12 +2626,12 @@ class Page(Document):
             `attributes` parameters to yield DOT that renders standalone.
             """
             keyword = _GRAPHVIZ_MACROS.get(macro_name, "")
-            if not keyword or _RE_DOT_GRAPH_HEADER.match(body):
+            if not keyword or _has_dot_graph_header(body):
                 return body
 
             graph_name = _dot_id(self._macro_parameter(macro, "name") or "G")
             attributes = self._macro_parameter(macro, "attributes")
-            statements = f"{attributes}\n{body}" if attributes else body
+            statements = f"{_dot_attribute_statements(attributes)}\n{body}" if attributes else body
             # Statements are emitted verbatim: DOT permits line-continued quoted strings
             # and HTML-like labels whose content would change if re-indented.
             return f"{keyword} {graph_name} {{\n{statements}\n}}"
@@ -2598,6 +2657,11 @@ class Page(Document):
             macro_name = str(el.get("data-macro-name", ""))
             dot: str | None = None
 
+            # Consumed up front, and unconditionally, so that positions stay aligned with
+            # the view HTML even when some diagrams on the page resolve through editor2:
+            # advancing only on fallback would pair later diagrams with earlier sources.
+            storage_macro = self._next_storage_macro(macro_name)
+
             # Strategy 1: editor2 with macro-id (Cloud)
             macro_id = el.get("data-macro-id")
             if macro_id:
@@ -2606,17 +2670,14 @@ class Page(Document):
                     dot = self._extract_dot_from_macro(macro_name, macro)
 
             # Strategy 2: body.storage fallback (Server / Data Center)
-            if not dot:
-                macro = self._next_storage_macro(macro_name)
-                if macro is not None:
-                    dot = self._extract_dot_from_macro(macro_name, macro)
+            if not dot and storage_macro is not None:
+                dot = self._extract_dot_from_macro(macro_name, storage_macro)
 
             if dot:
                 return f"\n```dot\n{dot}\n```\n\n"
 
             logger.warning(
-                f"Graphviz '{macro_name}' macro could not be resolved "
-                f"from editor2 or body.storage"
+                f"Graphviz '{macro_name}' macro could not be resolved from editor2 or body.storage"
             )
             return "\n<!-- Graphviz diagram (source not found) -->\n\n"
 
